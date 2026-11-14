@@ -3,21 +3,25 @@ import { createServer as createHttpListener, type IncomingMessage, type ServerRe
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { challenge, loadOAuthConfig, resourceMetadata, verifyOAuthToken, type OAuthConfig } from './oauth.js';
 
-export interface HttpConfig {
-    host: string;
-    port: number;
-    token: string;
-}
+export type HttpConfig = { host: string; port: number } & (
+    { token: string; oauth?: never } | { oauth: OAuthConfig; token?: never }
+);
 
 export function loadHttpConfig(env = process.env): HttpConfig {
+    const mode = env.REMNAWAVE_HTTP_AUTH || 'token';
+    if (mode !== 'token' && mode !== 'oauth') throw new Error('REMNAWAVE_HTTP_AUTH must be token or oauth');
     const token = env.REMNAWAVE_HTTP_TOKEN;
-    if (!token || !/^[A-Za-z0-9._~+/=-]+$/.test(token))
+    if (mode === 'token' && (!token || !/^[A-Za-z0-9._~+/=-]+$/.test(token)))
         throw new Error('REMNAWAVE_HTTP_TOKEN is required in HTTP mode (use a separate, random Bearer token)');
+    if (mode === 'oauth' && token)
+        throw new Error('Unset REMNAWAVE_HTTP_TOKEN in OAuth mode; static token fallback is not allowed');
     const port = Number(env.REMNAWAVE_HTTP_PORT || '3001');
     if (!Number.isInteger(port) || port < 1 || port > 65535)
         throw new Error('REMNAWAVE_HTTP_PORT must be an integer between 1 and 65535');
-    return { host: env.REMNAWAVE_HTTP_HOST || '127.0.0.1', port, token };
+    const address = { host: env.REMNAWAVE_HTTP_HOST || '127.0.0.1', port };
+    return mode === 'oauth' ? { ...address, oauth: loadOAuthConfig(env) } : { ...address, token: token! };
 }
 
 const MAX_SESSIONS = 32;
@@ -30,6 +34,7 @@ interface Session {
     transport: StreamableHTTPServerTransport;
     server: Server;
     lastActive: number;
+    principal: string;
 }
 
 function fail(res: ServerResponse, status: number, message: string) {
@@ -72,10 +77,10 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 /** One MCP server per session: privacy maps, node-job caches and version checks are never shared. */
-export function createHttpServer(cfg: HttpConfig, makeServer: () => Server) {
-    if (!cfg.token || !/^[A-Za-z0-9._~+/=-]+$/.test(cfg.token))
+export function createHttpServer(cfg: HttpConfig, makeServer: () => Server, fetcher: typeof fetch = fetch) {
+    if (!cfg.oauth && (!cfg.token || !/^[A-Za-z0-9._~+/=-]+$/.test(cfg.token)))
         throw new Error('REMNAWAVE_HTTP_TOKEN is required in HTTP mode');
-    const expected = hash(cfg.token);
+    const expected = cfg.oauth ? undefined : hash(cfg.token!);
     const sessions = new Map<string, Session>();
     let pending = 0;
     let active = 0;
@@ -86,29 +91,52 @@ export function createHttpServer(cfg: HttpConfig, makeServer: () => Server) {
     }
 
     async function route(req: IncomingMessage, res: ServerResponse) {
+        if (cfg.oauth && req.url === '/.well-known/oauth-protected-resource/mcp' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify(resourceMetadata(cfg.oauth)));
+            return;
+        }
         if (req.url !== '/mcp') return fail(res, 404, 'Not found');
 
         // This endpoint is for native/server-side clients, not browser cross-origin requests.
         // Reject Origin rather than enabling CORS or relying on the reverse proxy for this check.
         if (req.headers.origin !== undefined) return fail(res, 403, 'Origin not allowed');
 
-        const match = /^Bearer ([A-Za-z0-9._~+/=-]+)$/i.exec(req.headers.authorization ?? '');
-        if (!match || !timingSafeEqual(hash(match[1]), expected)) {
-            res.setHeader('WWW-Authenticate', 'Bearer');
-            return fail(res, 401, 'Unauthorized');
-        }
-        if (!['POST', 'GET', 'DELETE'].includes(req.method ?? '')) {
-            res.setHeader('Allow', 'POST, GET, DELETE');
-            return fail(res, 405, 'Method not allowed');
-        }
+        // Bound concurrent requests before making any calls to the authorization server.
         if (active >= MAX_REQUESTS) return fail(res, 503, 'Too many requests');
         active++;
         res.once('close', () => active--);
 
+        const match = /^Bearer ([A-Za-z0-9._~+/=-]+)$/i.exec(req.headers.authorization ?? '');
+        let principal = 'static';
+        if (cfg.oauth) {
+            if (!match) {
+                res.setHeader('WWW-Authenticate', challenge(cfg.oauth));
+                return fail(res, 401, 'Unauthorized');
+            }
+            const result = await verifyOAuthToken(cfg.oauth, match[1], fetcher);
+            if (!result.ok) {
+                if (result.status !== 503)
+                    res.setHeader('WWW-Authenticate', challenge(cfg.oauth, result.status === 403 ? 'insufficient_scope' : 'invalid_token'));
+                return fail(res, result.status, result.status === 503 ? 'Authorization server unavailable' : 'Access denied');
+            }
+            principal = result.principal;
+        } else if (!match || !timingSafeEqual(hash(match[1]), expected!)) {
+            res.setHeader('WWW-Authenticate', 'Bearer');
+            return fail(res, 401, 'Unauthorized');
+        }
+        if (res.destroyed) return;
+        // OAuth uses JSON responses only; do not leave a persistent authenticated GET stream open.
+        const methods = cfg.oauth ? ['POST', 'DELETE'] : ['POST', 'GET', 'DELETE'];
+        if (!methods.includes(req.method ?? '')) {
+            res.setHeader('Allow', methods.join(', '));
+            return fail(res, 405, 'Method not allowed');
+        }
+
         const id = req.headers['mcp-session-id'];
         if (Array.isArray(id)) return fail(res, 400, 'Invalid session ID');
         const session = id ? sessions.get(id) : undefined;
-        if (id && !session) return fail(res, 404, 'Session not found');
+        if (id && (!session || session.principal !== principal)) return fail(res, 404, 'Session not found');
 
         let body: unknown;
         if (req.method === 'POST') {
@@ -144,7 +172,7 @@ export function createHttpServer(cfg: HttpConfig, makeServer: () => Server) {
                     sessions.set(sid, next!);
                 },
             });
-            next = { transport, server: makeServer(), lastActive: Date.now() };
+            next = { transport, server: makeServer(), lastActive: Date.now(), principal };
             const current = next;
             transport.onclose = () => {
                 if (sessions.get(sessionId) === current) sessions.delete(sessionId);
