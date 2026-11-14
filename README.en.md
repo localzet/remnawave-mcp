@@ -430,7 +430,7 @@ REMNAWAVE_TRANSPORT=http node dist/index.js
 
 In a client supporting Streamable HTTP and custom headers, use
 `http://127.0.0.1:3001/mcp` with `Authorization: Bearer <HTTP_TOKEN>`.
-OAuth and cloud clients that require OAuth are not supported yet.
+For OAuth clients, see the separate mode below.
 Browser requests with an Origin header are rejected.
 
 For remote access use an HTTPS reverse proxy (nginx snippet inside a TLS server block):
@@ -460,6 +460,51 @@ any key holder can access all configured panels. Restrict access and rate-limit 
 `REMNAWAVE_READONLY=false` enables writes and `REMNAWAVE_PRIVACY=off` disables
 masking. Leaking the HTTP token in write mode gives the holder write access to the panel.
 Avoid these modes unless necessary, use HTTPS and least-privilege panel tokens.
+
+#### OAuth 2.1 (experimental resource server mode)
+
+Instead of a static key, use an external HTTPS OAuth authorization server
+supporting authorization code + PKCE S256 and token introspection (RFC 7662).
+The MCP server does not issue tokens or store user passwords.
+
+```bash
+export REMNAWAVE_TRANSPORT=http
+export REMNAWAVE_HTTP_AUTH=oauth
+unset REMNAWAVE_HTTP_TOKEN
+export REMNAWAVE_OAUTH_RESOURCE=https://mcp.example.com/mcp
+export REMNAWAVE_OAUTH_ISSUER=https://auth.example.com/
+export REMNAWAVE_OAUTH_INTROSPECTION_URL=https://auth.example.com/introspect
+export REMNAWAVE_OAUTH_CLIENT_ID=resource-server
+export REMNAWAVE_OAUTH_CLIENT_SECRET=YOUR_INTROSPECTION_SECRET
+node dist/index.js
+```
+
+The usual panel connection variables are also required. Introspection credentials
+belong to the MCP server, not to the OAuth client (ChatGPT, etc.).
+Supply secrets through a protected env file.
+
+Add the discovery endpoint to nginx:
+
+```nginx
+location = /.well-known/oauth-protected-resource/mcp {
+    proxy_pass http://127.0.0.1:3001;
+}
+```
+
+Configure the provider to return `active`, `iss`, `aud`, `exp`, `sub`,
+`client_id`, `token_type: "Bearer"` and `scope: "remnawave:read"` on introspection.
+The audience must contain the exact `REMNAWAVE_OAUTH_RESOURCE` URL and the issuer
+must match `REMNAWAVE_OAUTH_ISSUER`. Configure client registration, redirect URIs,
+PKCE, token issuance and revocation at the provider; compatibility with specific
+clients must be verified separately.
+
+Writes and relaxed privacy are prohibited in this mode; there is no static-token fallback.
+Every request is introspected and sessions are bound to issuer/subject/client_id.
+GET SSE streams are disabled (HTTP 405); POST returns JSON.
+This is **not** per-panel authorization: any user granted `remnawave:read`
+by the provider can access all configured panels. Use a separate deployment for each
+independent administrator/tenant.
+
 
 >
 > Your client is not listed? Any client that can launch local MCP servers works: command `node`, the path to `dist/index.js` and two variables — `REMNAWAVE_BASE_URL` and `REMNAWAVE_API_TOKEN`.
