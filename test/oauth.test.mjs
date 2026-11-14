@@ -104,6 +104,9 @@ test('OAuth discovery and HTTP sessions are bound to the authorized subject and 
     const sid = response.headers.get('mcp-session-id');
     assert.ok(sid);
     const protocol = (await response.json()).result.protocolVersion;
+    const initialized = await post('alice', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid, protocol);
+    assert.equal(initialized.status, 202);
+    await initialized.text();
     const ping = { jsonrpc: '2.0', id: 2, method: 'ping' };
     for (const token of ['bob', 'other-client']) {
         const denied = await post(token, ping, sid, protocol);
