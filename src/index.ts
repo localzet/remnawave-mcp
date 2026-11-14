@@ -35,6 +35,8 @@ async function main() {
     const opts = { cfg, tools: all, extras, serverVersion: SERVER_VERSION, contractVersion: CONTRACT_VERSION };
 
     if (http) {
+        if (http.oauth && (!cfg.readonly || cfg.privacy !== 'strict' || cfg.showSecrets))
+            throw new Error('OAuth mode requires read-only and strict privacy; unset write or privacy overrides');
         if (!cfg.readonly || cfg.privacy !== 'strict')
             console.error('WARNING: HTTP mode with write access or relaxed privacy. A leaked HTTP token grants this access; use HTTPS.');
         // Even a configured stdio pseudonym salt must not correlate different HTTP sessions.
