@@ -430,7 +430,7 @@ REMNAWAVE_TRANSPORT=http node dist/index.js
 
 В клиенте с поддержкой Streamable HTTP и пользовательских заголовков укажите
 `http://127.0.0.1:3001/mcp` и заголовок `Authorization: Bearer <HTTP_TOKEN>`.
-OAuth и подключение облачных клиентов, требующих OAuth, пока не поддерживаются.
+Для OAuth-клиентов см. отдельный режим ниже.
 Браузерные запросы с заголовком Origin отклоняются.
 
 Для удалённого доступа используйте HTTPS reverse proxy (пример фрагмента nginx внутри TLS server):
@@ -460,6 +460,50 @@ location = /mcp {
 `REMNAWAVE_READONLY=false` включает запись, а `REMNAWAVE_PRIVACY=off` отключает
 маскирование. Утечка HTTP-ключа в режиме записи означает доступ к изменению панели.
 Не включайте эти режимы без необходимости, используйте HTTPS и минимальные права токена панели.
+
+#### OAuth 2.1 (экспериментальный режим resource server)
+
+Вместо статического ключа можно использовать внешний OAuth authorization server
+с HTTPS, authorization code + PKCE S256 и интроспекцией токенов (RFC 7662).
+MCP-сервер не выпускает токены и не хранит пароли пользователей.
+
+```bash
+export REMNAWAVE_TRANSPORT=http
+export REMNAWAVE_HTTP_AUTH=oauth
+unset REMNAWAVE_HTTP_TOKEN
+export REMNAWAVE_OAUTH_RESOURCE=https://mcp.example.com/mcp
+export REMNAWAVE_OAUTH_ISSUER=https://auth.example.com/
+export REMNAWAVE_OAUTH_INTROSPECTION_URL=https://auth.example.com/introspect
+export REMNAWAVE_OAUTH_CLIENT_ID=resource-server
+export REMNAWAVE_OAUTH_CLIENT_SECRET=YOUR_INTROSPECTION_SECRET
+node dist/index.js
+```
+
+Также нужны обычные переменные подключения к панели. Учётные данные интроспекции
+принадлежат MCP-серверу, а не OAuth-клиенту (ChatGPT и т. п.).
+Передайте секреты через защищённый env-файл.
+
+В nginx дополнительно проксируйте discovery endpoint:
+
+```nginx
+location = /.well-known/oauth-protected-resource/mcp {
+    proxy_pass http://127.0.0.1:3001;
+}
+```
+
+Настройте провайдер так, чтобы интроспекция возвращала `active`, `iss`, `aud`,
+`exp`, `sub`, `client_id`, `token_type: "Bearer"` и `scope: "remnawave:read"`.
+`aud` должен содержать точный URL `REMNAWAVE_OAUTH_RESOURCE`, а `iss` совпадать с
+`REMNAWAVE_OAUTH_ISSUER`. Клиентская регистрация, redirect URI, PKCE, выпуск и отзыв
+токенов настраиваются в провайдере; совместимость с конкретным клиентом необходимо проверить.
+
+В этом режиме запись и ослабление strict privacy запрещены, статического fallback нет.
+Интроспекция выполняется на каждом запросе, сессия привязана к issuer/subject/client_id.
+GET-поток SSE отключён (HTTP 405); POST возвращает JSON.
+Это **не** разграничение прав на отдельные панели: любой пользователь, которому провайдер
+выдаёт scope `remnawave:read`, получает доступ ко всем настроенным панелям. Используйте
+отдельную инсталляцию для каждого независимого администратора/тенанта.
+
 
 >
 > Нет вашего клиента в списке? Подойдёт любой, который умеет запускать локальные MCP-серверы: укажите команду `node`, путь к `dist/index.js` и две переменные — `REMNAWAVE_BASE_URL` и `REMNAWAVE_API_TOKEN`.
